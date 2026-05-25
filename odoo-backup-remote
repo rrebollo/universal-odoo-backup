@@ -134,7 +134,7 @@ ssh_cmd() {
 # ─── get_remote_filestore_size ───────────────────────────────────────────────
 get_remote_filestore_size() {
   local data_dir
-  data_dir=$(ssh_cmd "grep -E '^\s*data_dir\s*=' $REMOTE_CONF 2>/dev/null | awk -F'=' '{print \$2}' | tr -d ' '" || true)
+  data_dir=$(ssh_cmd "grep -E '^\s*data_dir\s*=' $REMOTE_CONF 2>/dev/null | awk -F'=' '{print \$2}' | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//'" || true)
 
   if [ -z "$data_dir" ]; then
     # Use getent to get odoo user's home directory reliably
@@ -144,7 +144,8 @@ get_remote_filestore_size() {
   local fs_path="${data_dir}/filestore/${DB_NAME}"
 
   local size_mb
-  size_mb=$(ssh_cmd "sudo -u odoo du -sm $fs_path 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "0")
+  size_mb=$(ssh_cmd "sudo -u odoo du -sm '$fs_path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true)
+  size_mb="${size_mb:-0}"
 
   echo "$size_mb"
 }
@@ -167,7 +168,7 @@ check_remote_space() {
 
   local threshold_mb=$(( estimated_mb * 3 / 2 ))
 
-  echo "[INFO] Estimated backup size: $(( estimated_mb / 1024 )) GB ($(( estimated_mb % 1024 )) MB)"
+  echo "[INFO] Estimated backup size: $(awk "BEGIN {printf \"%.1f\", $estimated_mb/1024}") GB (${estimated_mb} MB)"
   echo "[INFO] Available space: ${available_gb} GB"
 
   if [ "$available_mb" -lt "$threshold_mb" ]; then
@@ -207,9 +208,9 @@ run_remote_backup() {
     return 1
   }
 
-  local output_file
-  output_file=$(mktemp)
-  ssh_cmd "sudo -u odoo env ODOO_CONF='$REMOTE_CONF' BACKUP_FORMAT='$BACKUP_FORMAT' BACKUP_DIR='$REMOTE_BACKUP_DIR' bash $script_file $DB_NAME" 2>&1 | tee "$output_file"
+   local output_file
+   output_file=$(mktemp)
+   ssh_cmd "sudo -u odoo env ODOO_CONF='$REMOTE_CONF' BACKUP_FORMAT='$BACKUP_FORMAT' BACKUP_DIR='$REMOTE_BACKUP_DIR' bash $script_file $DB_NAME" 2>&1 | tee "$output_file" >&2
 
   # Clean up remote temp file
   ssh_cmd "rm -f $script_file" 2>/dev/null || true
@@ -218,18 +219,23 @@ run_remote_backup() {
   output=$(cat "$output_file")
   rm -f "$output_file"
 
-  local backup_file
-  backup_file=$(echo "$output" | grep '\[INFO\] Done:' | tail -1 | sed 's/.*Done: \([^ ]*\).*/\1/')
+   local backup_file
+   backup_file=$(echo "$output" | grep '\[INFO\] Done:' | tail -1 | sed 's/.*Done: \([^ ]*\).*/\1/')
 
-  if [ -z "$backup_file" ]; then
-    echo "[ERROR] Could not determine remote backup file path." >&2
-    echo "[ERROR] Remote output was:" >&2
-    echo "$output" >&2
-    exit 1
-  fi
+   if [ -z "$backup_file" ]; then
+     echo "[ERROR] Could not determine remote backup file path." >&2
+     echo "[ERROR] Remote output was:" >&2
+     echo "$output" >&2
+     exit 1
+   fi
 
-  # Return backup file path via stdout ONLY - all logging goes to stderr
-  echo "$backup_file"
+   # Make backup file readable by rsync user before returning
+   ssh_cmd "sudo chmod o+r '$backup_file'" 2>/dev/null || {
+     echo "[WARN] Could not chmod backup file, rsync may fail due to permissions." >&2
+   }
+
+   # Return backup file path via stdout ONLY - all logging goes to stderr
+   echo "$backup_file"
 }
 
 # ─── check_partial_download ───────────────────────────────────────────────────
@@ -394,7 +400,7 @@ main() {
     local fs_size_mb
     fs_size_mb=$(get_remote_filestore_size)
     if [ "$fs_size_mb" -gt 0 ] 2>/dev/null; then
-      echo "[INFO] Filestore size: $(( fs_size_mb / 1024 )) GB ($(( fs_size_mb % 1024 )) MB)"
+      echo "[INFO] Filestore size: $(awk "BEGIN {printf \"%.1f\", $fs_size_mb/1024}") GB (${fs_size_mb} MB)"
     else
       echo "[WARN] Could not determine filestore size, using default estimate."
     fi
